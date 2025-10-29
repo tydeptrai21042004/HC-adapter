@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import json
 import os
+import re  # NEW
 
 from pathlib import Path
 
@@ -40,12 +41,26 @@ def get_args_parser():
 
     # --- Backbone + weights (torchvision multi-weight API) ---
     parser.add_argument('--backbone', type=str, default='resnet50',
-                        help="Torchvision name (e.g., resnet50, convnext_tiny, mobilenet_v3_large) "
-                             "or CIFAR aliases: cifar_resnet56|resnet56_cifar|akamaster_resnet56|resnet56_cifar10")
+                        help=("Torchvision name (e.g., resnet50, convnext_tiny) "
+                              "or CIFAR TorchHub names like cifar10_resnet56 / cifar100_resnet56 "
+                              "or akamaster aliases: resnet56_cifar|cifar_resnet56|akamaster_resnet56"))
     parser.add_argument('--weights', type=str, default='DEFAULT',
                         help="Torchvision weights: DEFAULT|none|IMAGENET1K_V1|ResNet50_Weights.IMAGENET1K_V2 ...")
     parser.add_argument('--list_backbones', action='store_true',
                         help='Print available torchvision model names and exit.')
+
+    # NEW: explicit pretrained toggle (used for Torch Hub models)
+    parser.add_argument('--pretrained', type=str2bool, default=None,
+                        help="Force using pretrained weights when hub supports it. "
+                             "If None, infer from --weights (DEFAULT => True).")
+    # NEW: keep head if it already matches nb_classes
+    parser.add_argument('--keep_pretrained_head', type=str2bool, default=True,
+                        help='Keep the original classifier if out_features == nb_classes.')
+
+    # NEW: which hub to use for CIFAR models
+    parser.add_argument('--cifar_hub', type=str, default='auto',
+                        choices=['auto', 'chenyaofo', 'akamaster'],
+                        help='Provider for CIFAR backbones. auto: infer from --backbone')
 
     # -------------------- Tuning method --------------------
     parser.add_argument('--tuning_method', type=str, default='prompt',
@@ -319,43 +334,68 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes
         )
 
-    # === BEGIN: General PET SHIM (supports many torchvision backbones + CIFAR ResNet56) ===
+    # === BEGIN: General PET SHIM (torchvision + CIFAR TorchHub backbones) ===
     if args.tuning_method in ('conv', 'adapter', 'hcc', 'residual'):
         import torchvision
 
-        # Resolve weights (torchvision)
+        # Heuristic: whether we want pretrained for TorchHub
+        if args.pretrained is None:
+            pretrained_flag = (args.weights is not None and str(args.weights).lower() not in ('none', 'scratch', 'random'))
+        else:
+            pretrained_flag = bool(args.pretrained)
+
+        # Resolve weights (torchvision path)
         tv_weights, has_new_api = _resolve_weights_multiapi(args.backbone, args.weights)
-        print(f"[Info] Backbone={args.backbone} | weights={args.weights} -> {tv_weights}")
+        print(f"[Info] Backbone={args.backbone} | tv_weights={args.weights} -> {tv_weights} | hub.pretrained={pretrained_flag}")
 
         # ---- Build backbone ----
-        try:
-            if has_new_api:
-                # Branch: CIFAR ResNet56 via torch.hub (akamaster)
-                if args.backbone in ('cifar_resnet56', 'resnet56_cifar', 'akamaster_resnet56', 'resnet56_cifar10'):
-                    # Proper CIFAR ResNet-56 (9,9,9) from akamaster repo via Torch Hub
-                    # Note: pretrained=False (repo typically provides training scripts, not weights)
-                    model_backbone = torch.hub.load(
-                        'akamaster/pytorch_resnet_cifar10', 'resnet56', pretrained=False
-                    )
-                    args.input_size = 32  # CIFAR models are 32x32 by design
-                    print("[Info] Loaded CIFAR ResNet-56 from Torch Hub; set input_size=32")
-                else:
+        model_backbone = None
+        used_provider = None
+
+        # Case A: chenyaofo CIFAR Hub (pretrained True/False)
+        if re.match(r'^cifar(10|100)_.+$', args.backbone) and (args.cifar_hub in ('auto', 'chenyaofo')):
+            used_provider = 'chenyaofo/pytorch-cifar-models'
+            model_backbone = torch.hub.load(  # pretrained weights available
+                used_provider, args.backbone, pretrained=pretrained_flag
+            )
+            args.input_size = 32
+            print(f"[Info] Loaded {args.backbone} from {used_provider} (input_size=32).")
+
+        # Case B: akamaster CIFAR-10 ResNet family (no official hub pretrain kwarg)
+        elif args.backbone in ('cifar_resnet56', 'resnet56_cifar', 'akamaster_resnet56', 'resnet56_cifar10') \
+             or (re.match(r'^akamaster_resnet(20|32|44|56|110)$', args.backbone) is not None) \
+             or (args.cifar_hub == 'akamaster' and re.match(r'^cifar10_resnet(20|32|44|56|110)$', args.backbone)):
+            used_provider = 'akamaster/pytorch_resnet_cifar10'
+            # Map to entry name expected by akamaster (resnetXX)
+            if args.backbone.startswith('akamaster_resnet'):
+                entry = args.backbone.replace('akamaster_', '')
+            else:
+                entry = re.sub(r'^cifar(10|100)_', '', args.backbone)
+                if not entry.startswith('resnet'):
+                    entry = 'resnet56'
+            model_backbone = torch.hub.load(used_provider, entry)  # no pretrained kw
+            args.input_size = 32
+            print(f"[Info] Loaded {entry} from {used_provider} (input_size=32).")
+
+        # Case C: torchvision (ImageNet family)
+        if model_backbone is None:
+            try:
+                used_provider = 'torchvision'
+                if has_new_api:
                     from torchvision.models import get_model
                     model_backbone = get_model(args.backbone, weights=tv_weights)
-            else:
-                # Legacy API
-                fn = getattr(torchvision.models, args.backbone, None)
-                if fn is None:
-                    raise AttributeError(f"Backbone '{args.backbone}' not found in torchvision.models")
-                pretrained = (tv_weights == 'legacy_pretrained')
-                try:
-                    model_backbone = fn(pretrained=pretrained, num_classes=1000)
-                except TypeError:
-                    model_backbone = fn(pretrained=pretrained)
-        except AttributeError as e:
-            raise RuntimeError(f"Backbone '{args.backbone}' is not available.") from e
+                else:
+                    fn = getattr(torchvision.models, args.backbone)
+                    pretrained = (tv_weights == 'legacy_pretrained')
+                    try:
+                        model_backbone = fn(pretrained=pretrained, num_classes=1000)
+                    except TypeError:
+                        model_backbone = fn(pretrained=pretrained)
+                print(f"[Info] Loaded {args.backbone} from torchvision.")
+            except AttributeError as e:
+                raise RuntimeError(f"Backbone '{args.backbone}' is not available in torchvision or supported hubs.") from e
 
-        # Freeze backbone (including BN)
+        # Freeze backbone (including BN) for PET
         for p_ in model_backbone.parameters():
             p_.requires_grad = False
         for m in model_backbone.modules():
@@ -378,25 +418,18 @@ def main(args):
                         nn.Conv2d(h, h, k, padding=k // 2, groups=h, bias=False), nn.ReLU(inplace=True),
                         nn.Conv2d(h, c, 1, bias=False)
                     )
-                def forward(self, x):
+                def forward(self, x):  # residual only
                     return self.net(x)
-            def make_adapter(ch):
-                return ConvAdapter(ch)
+            def make_adapter(ch): return ConvAdapter(ch)
 
         elif args.tuning_method == 'hcc':
             from models.hcc_adapter import HCCAdapter
             def make_adapter(ch):
                 m = HCCAdapter(
-                    C=ch,
-                    M=args.hcc_M,
-                    h=args.hcc_h,
-                    axis=args.hcc_axis,
-                    per_channel=args.hcc_per_channel,
-                    tie_sym=args.hcc_tie_sym,
-                    use_pw=args.hcc_use_pw,
-                    pw_ratio=args.hcc_pw_ratio,
-                    residual_scale=args.adapt_scale,
-                    gate_init=args.hcc_gate_init,
+                    C=ch, M=args.hcc_M, h=args.hcc_h, axis=args.hcc_axis,
+                    per_channel=args.hcc_per_channel, tie_sym=args.hcc_tie_sym,
+                    use_pw=args.hcc_use_pw, pw_ratio=args.hcc_pw_ratio,
+                    residual_scale=args.adapt_scale, gate_init=args.hcc_gate_init,
                     padding_mode={'reflect': 'reflect', 'replicate': 'replicate', 'zeros': 'zeros'}.get(args.hcc_padding, 'reflect')
                 )
                 m.is_hcc_adapter = True
@@ -410,7 +443,7 @@ def main(args):
                     attach_residual_adapters_resnet,
                     ParallelResidualAdapter, SeriesResidualAdapter
                 )
-                if args.backbone.startswith('resnet'):
+                if args.backbone.startswith('resnet'):  # torchvision ResNet only
                     stages = [int(s.strip()) for s in args.ra_stages.split(',') if s.strip().isdigit()]
                     model_backbone = attach_residual_adapters_resnet(
                         model_backbone,
@@ -422,7 +455,6 @@ def main(args):
                         stages=stages
                     )
                     ra_wrap_ok = True
-                    # collect adapter param ids for optimizer grouping
                     for mod in model_backbone.modules():
                         if isinstance(mod, (ParallelResidualAdapter, SeriesResidualAdapter)):
                             for p in mod.parameters():
@@ -432,12 +464,9 @@ def main(args):
                 print(f"[Warn] residual_adapter wrapper not available ({e}). Falling back to hook-based adapters.")
 
             if not ra_wrap_ok:
-                # generic fallback unit with hook
                 def _norm2d(c):
-                    if args.ra_norm == 'bn':
-                        return nn.BatchNorm2d(c)
-                    if args.ra_norm == 'ln':
-                        return nn.GroupNorm(1, c)  # LN-ish for 2D maps
+                    if args.ra_norm == 'bn': return nn.BatchNorm2d(c)
+                    if args.ra_norm == 'ln': return nn.GroupNorm(1, c)  # LN-ish
                     return nn.Identity()
                 def _act():
                     return {'relu': nn.ReLU, 'gelu': nn.GELU, 'silu': nn.SiLU, 'none': nn.Identity}[args.ra_act]()
@@ -452,11 +481,15 @@ def main(args):
                         self.gate = nn.Parameter(torch.tensor(float(args.ra_gate_init)))
                     def forward(self, x):
                         return self.core(x) * self.gate
-                def make_adapter(ch):
-                    return ResidualCore(ch)
+                def make_adapter(ch): return ResidualCore(ch)
 
-        # --- Attach adapters by family ---
-        from torchvision.models.resnet import BasicBlock, Bottleneck
+        # --- Attach adapters by family (robust to non-torchvision ResNets) ---
+        # Prefer dedicated classes when present
+        try:
+            from torchvision.models.resnet import BasicBlock, Bottleneck
+        except Exception:
+            BasicBlock = Bottleneck = tuple()
+
         try:
             from torchvision.models.convnext import CNBlock
         except Exception:
@@ -471,110 +504,97 @@ def main(args):
             InvertedResidual = tuple()
 
         def _attach(module: nn.Module, out_ch: int):
-            # If residual adapters were wrapped (ResNet path), skip hooking.
-            if args.tuning_method == 'residual' and args.backbone.startswith('resnet'):
+            # If residual adapters were wrapped (torchvision ResNet), skip hooking.
+            if args.tuning_method == 'residual' and isinstance(module, tuple(BasicBlock if isinstance(BasicBlock, tuple) else (BasicBlock,))) and args.backbone.startswith('resnet'):
                 return
             module.add_module('pet_adapter', make_adapter(out_ch))
 
             def hook(mod, _in, out):
-                # HCC returns x + gate*y internally
                 if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
                     return mod.pet_adapter(out)
-                # Conv-Adapter: add scaled residual
                 if args.tuning_method in ('conv', 'adapter'):
                     return out + args.adapt_scale * mod.pet_adapter(out)
-                # Residual adapters (hook fallback)
                 if args.tuning_method == 'residual':
                     xin = _in[0] if isinstance(_in, (tuple, list)) and len(_in) > 0 else out
-                    if args.ra_mode == 'parallel':
-                        return out + mod.pet_adapter(xin)
-                    else:
-                        return out + mod.pet_adapter(out)
+                    return out + (mod.pet_adapter(xin) if args.ra_mode == 'parallel' else mod.pet_adapter(out))
                 return out
-
             module.register_forward_hook(hook)
 
-        # Walk modules and attach to “block-level” units
         for m in model_backbone.modules():
-            # ResNet family
-            if isinstance(m, Bottleneck):
-                _attach(m, m.conv3.out_channels)
-            elif isinstance(m, BasicBlock):
-                _attach(m, m.conv2.out_channels)
-            # ConvNeXt
+            attached = False
+            # Torchvision ResNet classes
+            if BasicBlock and isinstance(m, BasicBlock):
+                _attach(m, m.conv2.out_channels); attached = True
+            elif Bottleneck and isinstance(m, Bottleneck):
+                _attach(m, m.conv3.out_channels); attached = True
+            # Generic ResNet-like (covers chenyaofo & preact blocks)
+            elif hasattr(m, 'conv3') and isinstance(getattr(m, 'conv3'), nn.Conv2d):
+                _attach(m, m.conv3.out_channels); attached = True
+            elif hasattr(m, 'conv2') and isinstance(getattr(m, 'conv2'), nn.Conv2d):
+                _attach(m, m.conv2.out_channels); attached = True
+            # ConvNeXt / EfficientNet / MobileNetV3
             elif CNBlock and isinstance(m, CNBlock):
                 if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
-                    out_ch = m.dwconv.out_channels
+                    _attach(m, m.dwconv.out_channels); attached = True
                 elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
-                    out_ch = m.block[0].out_channels
-                else:
-                    continue
-                _attach(m, out_ch)
-            # EfficientNet v1/v2
+                    _attach(m, m.block[0].out_channels); attached = True
             elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
                 out_ch = getattr(m, 'out_channels', None)
                 if out_ch is None:
                     last_conv = None
                     for c in m.modules():
-                        if isinstance(c, nn.Conv2d):
-                            last_conv = c
-                    if last_conv is None:
-                        continue
-                    out_ch = last_conv.out_channels
-                _attach(m, out_ch)
-            # MobileNetV3
+                        if isinstance(c, nn.Conv2d): last_conv = c
+                    if last_conv is not None:
+                        out_ch = last_conv.out_channels
+                if out_ch is not None:
+                    _attach(m, out_ch); attached = True
             elif InvertedResidual and isinstance(m, InvertedResidual):
                 out_ch = getattr(m, 'out_channels', None)
                 if out_ch is None:
                     last_conv = None
                     for c in m.modules():
-                        if isinstance(c, nn.Conv2d):
-                            last_conv = c
-                    if last_conv is None:
-                        continue
-                    out_ch = last_conv.out_channels
-                _attach(m, out_ch)
+                        if isinstance(c, nn.Conv2d): last_conv = c
+                    if last_conv is not None:
+                        out_ch = last_conv.out_channels
+                if out_ch is not None:
+                    _attach(m, out_ch); attached = True
 
-        # --- Replace classifier head to match nb_classes ---
-        def _replace_classifier(model: nn.Module, num_classes: int):
-            # Common patterns across torchvision models
-            if hasattr(model, 'fc') and isinstance(model.fc, nn.Linear):
-                in_f = model.fc.in_features
-                model.fc = nn.Linear(in_f, num_classes)
-                return
-            if hasattr(model, 'classifier'):
-                head = model.classifier
-                if isinstance(head, nn.Linear):
-                    model.classifier = nn.Linear(head.in_features, num_classes)
-                    return
-                if isinstance(head, nn.Sequential):
-                    new_seq = list(head)
-                    last_lin_idx = None
-                    for i in reversed(range(len(new_seq))):
-                        if isinstance(new_seq[i], nn.Linear):
-                            last_lin_idx = i
-                            break
-                    if last_lin_idx is not None:
-                        in_f = new_seq[last_lin_idx].in_features
-                        new_seq[last_lin_idx] = nn.Linear(in_f, num_classes)
-                        model.classifier = nn.Sequential(*new_seq)
-                        return
-            # Fallback (rare): attributes 'head' or 'heads'
-            for attr in ('head', 'heads'):
-                if hasattr(model, attr) and isinstance(getattr(model, attr), nn.Linear):
-                    lin = getattr(model, attr)
-                    setattr(model, attr, nn.Linear(lin.in_features, num_classes))
-                    return
-            # CIFAR ResNet from akamaster has 'linear' head
-            if hasattr(model, 'linear') and isinstance(model.linear, nn.Linear):
-                in_f = model.linear.in_features
-                model.linear = nn.Linear(in_f, num_classes)
-                return
-            raise RuntimeError("Couldn't find a classifier head to replace for this backbone.")
+        # --- Replace classifier head to match nb_classes (only if needed) ---
+        def _maybe_replace_linear(parent, name, lin: nn.Linear, num_classes: int):
+            if not isinstance(lin, nn.Linear):
+                return False
+            if args.keep_pretrained_head and lin.out_features == num_classes:
+                # keep pretrained head as-is
+                return False
+            new_lin = nn.Linear(lin.in_features, num_classes)
+            setattr(parent, name, new_lin)
+            return True
 
-        _replace_classifier(model_backbone, args.nb_classes)
+        replaced = False
+        # Common torchvision patterns
+        if hasattr(model_backbone, 'fc') and isinstance(model_backbone.fc, nn.Linear):
+            replaced = _maybe_replace_linear(model_backbone, 'fc', model_backbone.fc, args.nb_classes)
+        elif hasattr(model_backbone, 'classifier'):
+            head = model_backbone.classifier
+            if isinstance(head, nn.Linear):
+                replaced = _maybe_replace_linear(model_backbone, 'classifier', head, args.nb_classes)
+            elif isinstance(head, nn.Sequential):
+                new_seq = list(head)
+                for i in reversed(range(len(new_seq))):
+                    if isinstance(new_seq[i], nn.Linear):
+                        if not (args.keep_pretrained_head and new_seq[i].out_features == args.nb_classes):
+                            in_f = new_seq[i].in_features
+                            new_seq[i] = nn.Linear(in_f, args.nb_classes)
+                            model_backbone.classifier = nn.Sequential(*new_seq)
+                            replaced = True
+                        break
+        # CIFAR-style heads
+        if not replaced and hasattr(model_backbone, 'linear') and isinstance(model_backbone.linear, nn.Linear):
+            replaced = _maybe_replace_linear(model_backbone, 'linear', model_backbone.linear, args.nb_classes)
+        if not replaced and hasattr(model_backbone, 'head') and isinstance(model_backbone.head, nn.Linear):
+            replaced = _maybe_replace_linear(model_backbone, 'head', model_backbone.head, args.nb_classes)
+
         model = model_backbone
-
     else:
         # Fall back to repo's builder
         model = build_model(
@@ -776,7 +796,6 @@ def main(args):
                     print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
                 if log_writer is not None:
                     log_writer.update(test_acc1_ema=test_stats_ema['acc1'], head="perf", step=epoch)
-                # FIXED: correct dict-comprehension (k, v)
                 log_stats.update({**{f'test_{k}_ema': v for k, v in test_stats_ema.items()}})
 
         else:

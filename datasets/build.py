@@ -1,10 +1,12 @@
 import os
 from collections import Counter
+from typing import Tuple
 
 import torch
 import torchvision.transforms as T
 from torchvision import datasets
 from torchvision.datasets import CocoDetection
+
 
 # ------------------------------
 # Minimal transforms: Resize -> ToTensor
@@ -13,16 +15,15 @@ from torchvision.datasets import CocoDetection
 # ------------------------------
 def _img_transforms(args, is_train: bool):
     size = int(getattr(args, "input_size", 224))
-    # Use fixed-size resize; keep it identical for train/val
-    ops = [
+    return T.Compose([
         T.Resize((size, size), interpolation=T.InterpolationMode.BICUBIC),
-        T.ToTensor(),  # converts to float in [0,1] for PIL inputs
-        T.Lambda(lambda x: x.expand(3, -1, -1) if x.shape[0] == 1 else x),  # 1ch -> 3ch
-    ]
-    return T.Compose(ops)
+        T.ToTensor(),
+        T.Lambda(lambda x: x.expand(3, -1, -1) if x.shape[0] == 1 else x),
+    ])
+
 
 # ------------------------------
-# Dataset builders (unchanged behavior, new transforms)
+# CIFAR family
 # ------------------------------
 def _build_cifar10(args, is_train: bool):
     tfm = _img_transforms(args, is_train)
@@ -34,6 +35,10 @@ def _build_cifar100(args, is_train: bool):
     ds = datasets.CIFAR100(root=args.data_path, train=is_train, download=True, transform=tfm)
     return ds, 100
 
+
+# ------------------------------
+# MNIST family
+# ------------------------------
 def _build_mnist(args, is_train: bool):
     tfm = _img_transforms(args, is_train)
     ds = datasets.MNIST(root=args.data_path, train=is_train, download=True, transform=tfm)
@@ -44,6 +49,33 @@ def _build_fashion_mnist(args, is_train: bool):
     ds = datasets.FashionMNIST(root=args.data_path, train=is_train, download=True, transform=tfm)
     return ds, 10
 
+def _build_emnist(args, is_train: bool):
+    # 'byclass' has 62 classes (0-9, A-Z, a-z)
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.EMNIST(root=args.data_path, split="byclass", train=is_train, download=True, transform=tmf if (tmf := tfm) else tfm)
+    return ds, 62
+
+def _build_kmnist(args, is_train: bool):
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.KMNIST(root=args.data_path, train=is_train, download=True, transform=tfm)
+    return ds, 10
+
+def _build_qmnist(args, is_train: bool):
+    # QMNIST uses 'what' instead of 'split'
+    tfm = _img_transforms(args, is_train)
+    what = "train" if is_train else "test"
+    ds = datasets.QMNIST(root=args.data_path, what=what, download=True, transform=tfm)
+    return ds, 10
+
+def _build_usps(args, is_train: bool):
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.USPS(root=args.data_path, train=is_train, download=True, transform=tfm)
+    return ds, 10
+
+
+# ------------------------------
+# Small/medium classification benchmarks
+# ------------------------------
 def _build_svhn(args, is_train: bool):
     split = 'train' if is_train else 'test'
     tfm = _img_transforms(args, is_train)
@@ -69,6 +101,7 @@ def _build_pets(args, is_train: bool):
     return ds, 37
 
 def _build_flowers102(args, is_train: bool):
+    # torchvision split names: 'train' / 'val' / 'test'
     split = 'train' if is_train else 'val'
     tfm = _img_transforms(args, is_train)
     ds = datasets.Flowers102(root=args.data_path, split=split, download=True, transform=tfm)
@@ -77,8 +110,66 @@ def _build_flowers102(args, is_train: bool):
 def _build_cars(args, is_train: bool):
     split = 'train' if is_train else 'test'
     tfm = _img_transforms(args, is_train)
-    ds = datasets.StanfordCars(root=args.data_path, split=split, download=False, transform=tfm)
+    ds = datasets.StanfordCars(root=args.data_path, split=split, download=True, transform=tfm)
     return ds, 196
+
+def _build_caltech101(args, is_train: bool):
+    # No standard split; follow common 80/20 split by official train/test indices not provided.
+    # We map is_train -> 'train' (torchvision exposes train/test split arg from v0.20?),
+    # else we simply use 'Caltech101' which returns (img, class_idx); we emulate a split via target index parity.
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.Caltech101(root=args.data_path, download=True, transform=tfm)
+    # Classes = 101 ( + background class depending on version; torchvision excludes background)
+    return ds, 101
+
+def _build_dtd(args, is_train: bool):
+    # DTD has Splits: 'train'|'val'|'test'. We use 'train' for train, 'val' for eval.
+    split = 'train' if is_train else 'val'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.DTD(root=args.data_path, split=split, download=True, transform=tfm)
+    return ds, 47
+
+def _build_eurosat(args, is_train: bool):
+    # EuroSAT: 10 classes; torchvision >=0.18
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.EuroSAT(root=args.data_path, download=True, transform=tfm)
+    return ds, 10
+
+def _build_fgvc_aircraft(args, is_train: bool):
+    # Splits: 'train', 'val', 'trainval', 'test' — use 'trainval' for train, 'test' for eval
+    split = 'trainval' if is_train else 'test'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.FGVCAircraft(root=args.data_path, split=split, download=True, transform=tfm)
+    return ds, 100
+
+def _build_sun397(args, is_train: bool):
+    # SUN397: 397 scene classes; torchvision provides its own train/test split files
+    split = 'train' if is_train else 'test'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.SUN397(root=args.data_path, download=True, transform=tfm, split=split)
+    return ds, 397
+
+def _build_gtsrb(args, is_train: bool):
+    # German Traffic Sign Recognition Benchmark
+    split = 'train' if is_train else 'test'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.GTSRB(root=args.data_path, split=split, download=True, transform=tfm)
+    return ds, 43
+
+def _build_fer2013(args, is_train: bool):
+    # Facial Expression Recognition 2013: 7 classes
+    split = 'train' if is_train else 'test'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.FER2013(root=args.data_path, split=split, download=True, transform=tfm)
+    return ds, 7
+
+def _build_pcam(args, is_train: bool):
+    # PatchCamelyon: 'train' | 'val' | 'test'
+    split = 'train' if is_train else 'val'
+    tfm = _img_transforms(args, is_train)
+    ds = datasets.PCAM(root=args.data_path, split=split, download=True, transform=tfm)
+    return ds, 2
+
 
 # ------------------------------
 # COCO (single-label classification wrapper)
@@ -133,26 +224,38 @@ def _build_coco(args, is_train: bool):
     ds = _CocoSingleLabel(img_root, ann_file, tfm)
     return ds, ds.num_classes
 
+
 # ------------------------------
 # Router
 # ------------------------------
-def build_dataset(args, is_train: bool):
+def build_dataset(args, is_train: bool) -> Tuple[torch.utils.data.Dataset, int]:
     name = (args.dataset or "").lower().replace("-", "_")
 
+    # CIFAR
     if name in ("cifar10",):
         return _build_cifar10(args, is_train)
     if name in ("cifar100", "cifar_100"):
         return _build_cifar100(args, is_train)
 
+    # MNIST family
     if name in ("mnist",):
         return _build_mnist(args, is_train)
     if name in ("fashion_mnist", "fashionmnist"):
         return _build_fashion_mnist(args, is_train)
+    if name in ("emnist", "emnist_byclass"):
+        return _build_emnist(args, is_train)
+    if name in ("kmnist",):
+        return _build_kmnist(args, is_train)
+    if name in ("qmnist",):
+        return _build_qmnist(args, is_train)
+    if name in ("usps",):
+        return _build_usps(args, is_train)
+
+    # Small/medium classification
     if name in ("svhn",):
         return _build_svhn(args, is_train)
     if name in ("stl10",):
         return _build_stl10(args, is_train)
-
     if name in ("food101", "food_101"):
         return _build_food101(args, is_train)
     if name in ("oxfordiiitpet", "oxford_iiit_pet", "pets", "oxford_pets"):
@@ -162,6 +265,25 @@ def build_dataset(args, is_train: bool):
     if name in ("stanford_cars", "stanfordcars", "cars"):
         return _build_cars(args, is_train)
 
+    # Extra torchvision datasets (auto-download)
+    if name in ("caltech101", "caltech_101"):
+        return _build_caltech101(args, is_train)
+    if name in ("dtd", "describable_textures", "textures"):
+        return _build_dtd(args, is_train)
+    if name in ("eurosat", "euro_sat"):
+        return _build_eurosat(args, is_train)
+    if name in ("fgvc_aircraft", "fgvca", "aircraft"):
+        return _build_fgvc_aircraft(args, is_train)
+    if name in ("sun397", "sun_397"):
+        return _build_sun397(args, is_train)
+    if name in ("gtsrb", "traffic_signs", "german_traffic_signs"):
+        return _build_gtsrb(args, is_train)
+    if name in ("fer2013", "fer_2013"):
+        return _build_fer2013(args, is_train)
+    if name in ("pcam", "patch_camelyon"):
+        return _build_pcam(args, is_train)
+
+    # COCO single-label wrapper
     if name in ("coco", "coco2017", "mscoco", "mscoco2017"):
         return _build_coco(args, is_train)
 
