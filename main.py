@@ -1,4 +1,4 @@
-# main.py
+# main.py  — ConvNeXt / ResNet training with PET adapters + CLIP linear probe
 import argparse
 import datetime
 import numpy as np
@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import json
 import os
-import re  # NEW
+import re
 
 from pathlib import Path
 
@@ -39,7 +39,7 @@ def str2bool(v):
 def get_args_parser():
     parser = argparse.ArgumentParser('Parameter Efficient Tuning', add_help=False)
 
-    # --- Backbone + weights (torchvision multi-weight API) ---
+    # --- Backbone (torchvision or CIFAR torch.hub) ---
     parser.add_argument('--backbone', type=str, default='resnet50',
                         help=("Torchvision name (e.g., resnet50, convnext_tiny) "
                               "or CIFAR TorchHub names like cifar10_resnet56 / cifar100_resnet56 "
@@ -49,18 +49,27 @@ def get_args_parser():
     parser.add_argument('--list_backbones', action='store_true',
                         help='Print available torchvision model names and exit.')
 
-    # NEW: explicit pretrained toggle (used for Torch Hub models)
+    # Explicit pretrained toggle for torch.hub backbones
     parser.add_argument('--pretrained', type=str2bool, default=None,
-                        help="Force using pretrained weights when hub supports it. "
-                             "If None, infer from --weights (DEFAULT => True).")
-    # NEW: keep head if it already matches nb_classes
+                        help="Force using pretrained weights when hub supports it. If None, infer from --weights.")
     parser.add_argument('--keep_pretrained_head', type=str2bool, default=True,
                         help='Keep the original classifier if out_features == nb_classes.')
 
-    # NEW: which hub to use for CIFAR models
+    # CIFAR hub selector
     parser.add_argument('--cifar_hub', type=str, default='auto',
                         choices=['auto', 'chenyaofo', 'akamaster'],
                         help='Provider for CIFAR backbones. auto: infer from --backbone')
+
+    # -------------------- CLIP branch --------------------
+    parser.add_argument('--clip_model', type=str, default=None,
+                        choices=['RN50', 'RN50x4'],
+                        help='Use CLIP visual tower (OpenAI names). When set, a linear probe head is added.')
+    parser.add_argument('--clip_pretrained', type=str, default='openai',
+                        help=("Which weights to load. "
+                              "If 'openai', use OpenAI CLIP (clip.load). "
+                              "If using OpenCLIP, pass a tag like 'openai' or 'laion2b_s34b_b79k'."))
+    parser.add_argument('--freeze_backbone', type=str2bool, default=True,
+                        help='Freeze backbone (incl. CLIP visual) and train only adapters / head.')
 
     # -------------------- Tuning method --------------------
     parser.add_argument('--tuning_method', type=str, default='prompt',
@@ -98,25 +107,24 @@ def get_args_parser():
     parser.add_argument('--ra_stages', type=str, default='1,2,3,4',
                         help='ResNet stages to adapt (comma list), e.g., "2,3,4"')
 
+    # Batch / epochs
     parser.add_argument('--batch_size', default=64, type=int, help='Per GPU batch size')
     parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('--update_freq', default=1, type=int, help='gradient accumulation steps')
-
     parser.add_argument('--fs_shot', default=16, type=int)
 
-    # Model parameters
+    # Generic model params
     parser.add_argument('--model', default='resnet50_clip', type=str, metavar='MODEL',
                         help='Used only when not using PET shim')
-    parser.add_argument('--drop_path', type=float, default=0, metavar='PCT',
-                        help='Drop path rate (default: 0.0)')
-    parser.add_argument('--input_size', default=224, type=int, help='image input size')
-    parser.add_argument('--crop_ratio', default=0.875, type=float, help='image input size')
+    parser.add_argument('--drop_path', type=float, default=0, metavar='PCT')
+    parser.add_argument('--input_size', default=224, type=int, help='image input size (overridden by CLIP preprocess)')
+    parser.add_argument('--crop_ratio', default=0.875, type=float)
 
     # EMA
     parser.add_argument('--model_ema', type=str2bool, default=False)
     parser.add_argument('--model_ema_decay', type=float, default=0.9999)
     parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False)
-    parser.add_argument('--model_ema_eval', type=str2bool, default=False, help='Use EMA for eval during training.')
+    parser.add_argument('--model_ema_eval', type=str2bool, default=False)
 
     # Optimization
     parser.add_argument('--opt_eps', default=1e-8, type=float, metavar='EPSILON')
@@ -127,8 +135,7 @@ def get_args_parser():
     parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR')
     parser.add_argument('--warmup_epochs', type=int, default=0, metavar='N')
     parser.add_argument('--warmup_steps', type=int, default=-1, metavar='N')
-    parser.add_argument('--weight_decay_end', type=float, default=None,
-                        help='Final WD for cosine schedule (default: same as --weight_decay)')
+    parser.add_argument('--weight_decay_end', type=float, default=None)
 
     # Augmentation
     parser.add_argument('--color_jitter', type=float, default=0.0, metavar='PCT')
@@ -203,13 +210,6 @@ def get_args_parser():
 
 
 def _resolve_weights_multiapi(backbone: str, weights_str: str):
-    """
-    Resolve torchvision weights across versions:
-      - Modern API: get_model_weights / get_weight
-      - Accept 'none' / 'scratch' / '' -> None
-      - Accept 'DEFAULT' or enum members (IMAGENET1K_V1, etc.)
-      - Accept fully-qualified names like 'ResNet50_Weights.IMAGENET1K_V2'
-    """
     try:
         from torchvision.models import get_model_weights, get_weight  # noqa: F401
         has_new_api = True
@@ -220,7 +220,6 @@ def _resolve_weights_multiapi(backbone: str, weights_str: str):
         return None, has_new_api
 
     if not has_new_api:
-        # Old API fallback: treat anything not 'none' as pretrained=True
         return 'legacy_pretrained', False
 
     if '.' in weights_str:
@@ -240,8 +239,49 @@ def _resolve_weights_multiapi(backbone: str, weights_str: str):
     return None, True
 
 
+def _infer_clip_input_size(preprocess):
+    # Infer input size from CLIP preprocess transforms (CenterCrop/Resize)
+    size = None
+    try:
+        ts = getattr(preprocess, 'transforms', None) or []
+        # prefer CenterCrop, else Resize
+        for t in ts:
+            name = t.__class__.__name__.lower()
+            if 'centercrop' in name and hasattr(t, 'size'):
+                size = t.size[0] if isinstance(t.size, (tuple, list)) else int(t.size)
+        if size is None:
+            for t in ts:
+                name = t.__class__.__name__.lower()
+                if 'resize' in name and hasattr(t, 'size'):
+                    val = t.size
+                    if isinstance(val, (tuple, list)):  # (short, long) or (h, w)
+                        size = max(val)
+                    else:
+                        size = int(val)
+    except Exception:
+        size = None
+    return size or 224
+
+
+class CLIPLinearProbe(nn.Module):
+    def __init__(self, visual_module: nn.Module, feat_dim: int, num_classes: int, freeze_backbone: bool = True):
+        super().__init__()
+        self.visual = visual_module
+        if freeze_backbone:
+            for p in self.visual.parameters():
+                p.requires_grad = False
+            self.visual.eval()
+        self.head = nn.Linear(feat_dim, num_classes)
+
+    def forward(self, x):
+        # x must already be CLIP-preprocessed (normalize/resize/crop)
+        feats = self.visual(x)
+        # OpenAI CLIP ResNet visual returns pooled features [B, D]
+        return self.head(feats)
+
+
 def main(args):
-    # Early: handle --list_backbones
+    # Early: --list_backbones
     if args.list_backbones:
         try:
             from torchvision.models import list_models
@@ -255,7 +295,7 @@ def main(args):
 
     utils.init_distributed_mode(args)
 
-    # Device selection with CPU fallback
+    # Device selection
     if str(args.device).lower().startswith('cuda'):
         if not torch.cuda.is_available():
             print("[Info] CUDA not available — falling back to CPU.")
@@ -272,14 +312,70 @@ def main(args):
     seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
-    cudnn.benchmark = (device.type == 'cuda')  # True for speed on GPU
+    cudnn.benchmark = (device.type == 'cuda')
 
+    # ===== Optional: Preload CLIP preprocess so we can apply to datasets =====
+    clip_preprocess = None
+    clip_visual = None
+    clip_feat_dim = None
+    if args.clip_model:
+        # Try OpenAI CLIP first, then OpenCLIP
+        ok = False
+        try:
+            import clip  # OpenAI CLIP
+            clip_model_full, clip_preprocess = clip.load(args.clip_model, device='cpu', jit=False)
+            clip_visual = clip_model_full.visual
+            # Prefer attribute if present, else probe
+            clip_feat_dim = getattr(clip_visual, 'output_dim', None)
+            if clip_feat_dim is None:
+                with torch.no_grad():
+                    dummy = torch.zeros(1, 3,  _infer_clip_input_size(clip_preprocess), _infer_clip_input_size(clip_preprocess))
+                    clip_feat_dim = clip_visual(dummy).shape[1]
+            ok = True
+            print(f"[CLIP] Loaded OpenAI {args.clip_model} (pretrained='{args.clip_pretrained}')")
+        except Exception as e:
+            print(f"[CLIP] OpenAI CLIP load failed ({e}). Trying OpenCLIP ...")
+            try:
+                import open_clip
+                model_name = args.clip_model  # OpenCLIP accepts RN50 / RN50x4 aliases
+                model_full, _, clip_preprocess = open_clip.create_model_and_transforms(
+                    model_name, pretrained=args.clip_pretrained
+                )
+                clip_visual = model_full.visual
+                clip_feat_dim = getattr(clip_visual, 'output_dim', None)
+                if clip_feat_dim is None:
+                    with torch.no_grad():
+                        dummy = torch.zeros(1, 3, _infer_clip_input_size(clip_preprocess), _infer_clip_input_size(clip_preprocess))
+                        clip_feat_dim = clip_visual(dummy).shape[1]
+                ok = True
+                print(f"[CLIP] Loaded OpenCLIP {model_name} (pretrained='{args.clip_pretrained}')")
+            except Exception as e2:
+                raise RuntimeError(f"Failed to load CLIP ({args.clip_model}) via OpenAI and OpenCLIP: {e2}")
+
+        if ok:
+            # set input_size from preprocess
+            args.input_size = _infer_clip_input_size(clip_preprocess)
+
+    # ===== Build datasets =====
     dataset_train, args.nb_classes = build_dataset(args=args, is_train=True)
     if args.disable_eval:
         args.dist_eval = False
         dataset_val = None
     else:
         dataset_val, _ = build_dataset(args=args, is_train=False)
+
+    # If CLIP is active, override dataset transforms to CLIP preprocess
+    if args.clip_model and clip_preprocess is not None:
+        for ds in [dataset_train, dataset_val]:
+            if ds is None:
+                continue
+            # common pattern: dataset.transform exists
+            if hasattr(ds, 'transform'):
+                ds.transform = clip_preprocess
+            # also try attribute names used by some repos
+            if hasattr(ds, 'transforms'):
+                ds.transforms = clip_preprocess
+
     print(len(dataset_val) if dataset_val is not None else 0)
 
     num_tasks = utils.get_world_size()
@@ -303,11 +399,6 @@ def main(args):
         log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
     else:
         log_writer = None
-
-    if global_rank == 0 and args.enable_wandb:
-        wandb_logger = utils.WandbLogger(args)
-    else:
-        wandb_logger = None
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train, sampler=sampler_train,
@@ -334,282 +425,279 @@ def main(args):
             label_smoothing=args.smoothing, num_classes=args.nb_classes
         )
 
-    # === BEGIN: General PET SHIM (torchvision + CIFAR TorchHub backbones) ===
-    if args.tuning_method in ('conv', 'adapter', 'hcc', 'residual'):
-        import torchvision
-
-        # Heuristic: whether we want pretrained for TorchHub
-        if args.pretrained is None:
-            pretrained_flag = (args.weights is not None and str(args.weights).lower() not in ('none', 'scratch', 'random'))
-        else:
-            pretrained_flag = bool(args.pretrained)
-
-        # Resolve weights (torchvision path)
-        tv_weights, has_new_api = _resolve_weights_multiapi(args.backbone, args.weights)
-        print(f"[Info] Backbone={args.backbone} | tv_weights={args.weights} -> {tv_weights} | hub.pretrained={pretrained_flag}")
-
-        # ---- Build backbone ----
-        model_backbone = None
-        used_provider = None
-
-        # Case A: chenyaofo CIFAR Hub (pretrained True/False)
-        if re.match(r'^cifar(10|100)_.+$', args.backbone) and (args.cifar_hub in ('auto', 'chenyaofo')):
-            used_provider = 'chenyaofo/pytorch-cifar-models'
-            model_backbone = torch.hub.load(  # pretrained weights available
-                used_provider, args.backbone, pretrained=pretrained_flag
-            )
-            args.input_size = 32
-            print(f"[Info] Loaded {args.backbone} from {used_provider} (input_size=32).")
-
-        # Case B: akamaster CIFAR-10 ResNet family (no official hub pretrain kwarg)
-        elif args.backbone in ('cifar_resnet56', 'resnet56_cifar', 'akamaster_resnet56', 'resnet56_cifar10') \
-             or (re.match(r'^akamaster_resnet(20|32|44|56|110)$', args.backbone) is not None) \
-             or (args.cifar_hub == 'akamaster' and re.match(r'^cifar10_resnet(20|32|44|56|110)$', args.backbone)):
-            used_provider = 'akamaster/pytorch_resnet_cifar10'
-            # Map to entry name expected by akamaster (resnetXX)
-            if args.backbone.startswith('akamaster_resnet'):
-                entry = args.backbone.replace('akamaster_', '')
-            else:
-                entry = re.sub(r'^cifar(10|100)_', '', args.backbone)
-                if not entry.startswith('resnet'):
-                    entry = 'resnet56'
-            model_backbone = torch.hub.load(used_provider, entry)  # no pretrained kw
-            args.input_size = 32
-            print(f"[Info] Loaded {entry} from {used_provider} (input_size=32).")
-
-        # Case C: torchvision (ImageNet family)
-        if model_backbone is None:
-            try:
-                used_provider = 'torchvision'
-                if has_new_api:
-                    from torchvision.models import get_model
-                    model_backbone = get_model(args.backbone, weights=tv_weights)
-                else:
-                    fn = getattr(torchvision.models, args.backbone)
-                    pretrained = (tv_weights == 'legacy_pretrained')
-                    try:
-                        model_backbone = fn(pretrained=pretrained, num_classes=1000)
-                    except TypeError:
-                        model_backbone = fn(pretrained=pretrained)
-                print(f"[Info] Loaded {args.backbone} from torchvision.")
-            except AttributeError as e:
-                raise RuntimeError(f"Backbone '{args.backbone}' is not available in torchvision or supported hubs.") from e
-
-        # Freeze backbone (including BN) for PET
-        for p_ in model_backbone.parameters():
-            p_.requires_grad = False
-        for m in model_backbone.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
-                if m.affine:
-                    if m.weight is not None:
-                        m.weight.requires_grad = False
-                    if m.bias is not None:
-                        m.bias.requires_grad = False
-
-        # --- Adapters ---
-        if args.tuning_method in ('conv', 'adapter'):
-            class ConvAdapter(nn.Module):
-                def __init__(self, c, k=args.kernel_size):
-                    super().__init__()
-                    h = max(1, int(c // max(1, int(args.adapt_size))))
-                    self.net = nn.Sequential(
-                        nn.Conv2d(c, h, 1, bias=False), nn.ReLU(inplace=True),
-                        nn.Conv2d(h, h, k, padding=k // 2, groups=h, bias=False), nn.ReLU(inplace=True),
-                        nn.Conv2d(h, c, 1, bias=False)
-                    )
-                def forward(self, x):  # residual only
-                    return self.net(x)
-            def make_adapter(ch): return ConvAdapter(ch)
-
-        elif args.tuning_method == 'hcc':
-            from models.hcc_adapter import HCCAdapter
-            def make_adapter(ch):
-                m = HCCAdapter(
-                    C=ch, M=args.hcc_M, h=args.hcc_h, axis=args.hcc_axis,
-                    per_channel=args.hcc_per_channel, tie_sym=args.hcc_tie_sym,
-                    use_pw=args.hcc_use_pw, pw_ratio=args.hcc_pw_ratio,
-                    residual_scale=args.adapt_scale, gate_init=args.hcc_gate_init,
-                    padding_mode={'reflect': 'reflect', 'replicate': 'replicate', 'zeros': 'zeros'}.get(args.hcc_padding, 'reflect')
-                )
-                m.is_hcc_adapter = True
-                return m
-
-        else:  # residual adapters
-            ra_wrap_ok = False
-            ra_adapter_param_ids = set()
-            try:
-                from models.tuning_modules.residual_adapter import (
-                    attach_residual_adapters_resnet,
-                    ParallelResidualAdapter, SeriesResidualAdapter
-                )
-                if args.backbone.startswith('resnet'):  # torchvision ResNet only
-                    stages = [int(s.strip()) for s in args.ra_stages.split(',') if s.strip().isdigit()]
-                    model_backbone = attach_residual_adapters_resnet(
-                        model_backbone,
-                        mode=args.ra_mode,
-                        reduction=args.ra_reduction,
-                        norm=args.ra_norm,
-                        act=args.ra_act,
-                        gate_init=args.ra_gate_init,
-                        stages=stages
-                    )
-                    ra_wrap_ok = True
-                    for mod in model_backbone.modules():
-                        if isinstance(mod, (ParallelResidualAdapter, SeriesResidualAdapter)):
-                            for p in mod.parameters():
-                                if p.requires_grad:
-                                    ra_adapter_param_ids.add(id(p))
-            except Exception as e:
-                print(f"[Warn] residual_adapter wrapper not available ({e}). Falling back to hook-based adapters.")
-
-            if not ra_wrap_ok:
-                def _norm2d(c):
-                    if args.ra_norm == 'bn': return nn.BatchNorm2d(c)
-                    if args.ra_norm == 'ln': return nn.GroupNorm(1, c)  # LN-ish
-                    return nn.Identity()
-                def _act():
-                    return {'relu': nn.ReLU, 'gelu': nn.GELU, 'silu': nn.SiLU, 'none': nn.Identity}[args.ra_act]()
-                class ResidualCore(nn.Module):
-                    def __init__(self, c):
-                        super().__init__()
-                        h = max(1, c // max(1, args.ra_reduction))
-                        self.core = nn.Sequential(
-                            nn.Conv2d(c, h, 1, bias=False), _norm2d(h), _act(),
-                            nn.Conv2d(h, c, 1, bias=False), _norm2d(c)
-                        )
-                        self.gate = nn.Parameter(torch.tensor(float(args.ra_gate_init)))
-                    def forward(self, x):
-                        return self.core(x) * self.gate
-                def make_adapter(ch): return ResidualCore(ch)
-
-        # --- Attach adapters by family (robust to non-torchvision ResNets) ---
-        # Prefer dedicated classes when present
-        try:
-            from torchvision.models.resnet import BasicBlock, Bottleneck
-        except Exception:
-            BasicBlock = Bottleneck = tuple()
-
-        try:
-            from torchvision.models.convnext import CNBlock
-        except Exception:
-            CNBlock = tuple()
-        try:
-            from torchvision.models.efficientnet import MBConv, FusedMBConv
-        except Exception:
-            MBConv = FusedMBConv = tuple()
-        try:
-            from torchvision.models.mobilenetv3 import InvertedResidual
-        except Exception:
-            InvertedResidual = tuple()
-
-        def _attach(module: nn.Module, out_ch: int):
-            # If residual adapters were wrapped (torchvision ResNet), skip hooking.
-            if args.tuning_method == 'residual' and isinstance(module, tuple(BasicBlock if isinstance(BasicBlock, tuple) else (BasicBlock,))) and args.backbone.startswith('resnet'):
-                return
-            module.add_module('pet_adapter', make_adapter(out_ch))
-
-            def hook(mod, _in, out):
-                if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
-                    return mod.pet_adapter(out)
-                if args.tuning_method in ('conv', 'adapter'):
-                    return out + args.adapt_scale * mod.pet_adapter(out)
-                if args.tuning_method == 'residual':
-                    xin = _in[0] if isinstance(_in, (tuple, list)) and len(_in) > 0 else out
-                    return out + (mod.pet_adapter(xin) if args.ra_mode == 'parallel' else mod.pet_adapter(out))
-                return out
-            module.register_forward_hook(hook)
-
-        for m in model_backbone.modules():
-            attached = False
-            # Torchvision ResNet classes
-            if BasicBlock and isinstance(m, BasicBlock):
-                _attach(m, m.conv2.out_channels); attached = True
-            elif Bottleneck and isinstance(m, Bottleneck):
-                _attach(m, m.conv3.out_channels); attached = True
-            # Generic ResNet-like (covers chenyaofo & preact blocks)
-            elif hasattr(m, 'conv3') and isinstance(getattr(m, 'conv3'), nn.Conv2d):
-                _attach(m, m.conv3.out_channels); attached = True
-            elif hasattr(m, 'conv2') and isinstance(getattr(m, 'conv2'), nn.Conv2d):
-                _attach(m, m.conv2.out_channels); attached = True
-            # ConvNeXt / EfficientNet / MobileNetV3
-            elif CNBlock and isinstance(m, CNBlock):
-                if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
-                    _attach(m, m.dwconv.out_channels); attached = True
-                elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
-                    _attach(m, m.block[0].out_channels); attached = True
-            elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
-                out_ch = getattr(m, 'out_channels', None)
-                if out_ch is None:
-                    last_conv = None
-                    for c in m.modules():
-                        if isinstance(c, nn.Conv2d): last_conv = c
-                    if last_conv is not None:
-                        out_ch = last_conv.out_channels
-                if out_ch is not None:
-                    _attach(m, out_ch); attached = True
-            elif InvertedResidual and isinstance(m, InvertedResidual):
-                out_ch = getattr(m, 'out_channels', None)
-                if out_ch is None:
-                    last_conv = None
-                    for c in m.modules():
-                        if isinstance(c, nn.Conv2d): last_conv = c
-                    if last_conv is not None:
-                        out_ch = last_conv.out_channels
-                if out_ch is not None:
-                    _attach(m, out_ch); attached = True
-
-        # --- Replace classifier head to match nb_classes (only if needed) ---
-        def _maybe_replace_linear(parent, name, lin: nn.Linear, num_classes: int):
-            if not isinstance(lin, nn.Linear):
-                return False
-            if args.keep_pretrained_head and lin.out_features == num_classes:
-                # keep pretrained head as-is
-                return False
-            new_lin = nn.Linear(lin.in_features, num_classes)
-            setattr(parent, name, new_lin)
-            return True
-
-        replaced = False
-        # Common torchvision patterns
-        if hasattr(model_backbone, 'fc') and isinstance(model_backbone.fc, nn.Linear):
-            replaced = _maybe_replace_linear(model_backbone, 'fc', model_backbone.fc, args.nb_classes)
-        elif hasattr(model_backbone, 'classifier'):
-            head = model_backbone.classifier
-            if isinstance(head, nn.Linear):
-                replaced = _maybe_replace_linear(model_backbone, 'classifier', head, args.nb_classes)
-            elif isinstance(head, nn.Sequential):
-                new_seq = list(head)
-                for i in reversed(range(len(new_seq))):
-                    if isinstance(new_seq[i], nn.Linear):
-                        if not (args.keep_pretrained_head and new_seq[i].out_features == args.nb_classes):
-                            in_f = new_seq[i].in_features
-                            new_seq[i] = nn.Linear(in_f, args.nb_classes)
-                            model_backbone.classifier = nn.Sequential(*new_seq)
-                            replaced = True
-                        break
-        # CIFAR-style heads
-        if not replaced and hasattr(model_backbone, 'linear') and isinstance(model_backbone.linear, nn.Linear):
-            replaced = _maybe_replace_linear(model_backbone, 'linear', model_backbone.linear, args.nb_classes)
-        if not replaced and hasattr(model_backbone, 'head') and isinstance(model_backbone.head, nn.Linear):
-            replaced = _maybe_replace_linear(model_backbone, 'head', model_backbone.head, args.nb_classes)
-
-        model = model_backbone
-    else:
-        # Fall back to repo's builder
-        model = build_model(
-            args.model,
-            pretrained=True,
+    # === Build model ===
+    # Branch A: CLIP linear probe (overrides PET)
+    if args.clip_model:
+        if clip_visual is None or clip_feat_dim is None:
+            raise RuntimeError("CLIP requested but not initialized.")
+        model = CLIPLinearProbe(
+            visual_module=clip_visual,
+            feat_dim=int(clip_feat_dim),
             num_classes=args.nb_classes,
-            tuning_method=args.tuning_method,
-            args=args,
+            freeze_backbone=bool(args.freeze_backbone),
         )
-    # === END: General PET SHIM ===
+    else:
+        # Branch B: General PET shim (torchvision + CIFAR torch.hub backbones)
+        if args.tuning_method in ('conv', 'adapter', 'hcc', 'residual'):
+            import torchvision
+
+            # Heuristic: whether we want pretrained for TorchHub
+            if args.pretrained is None:
+                pretrained_flag = (args.weights is not None and str(args.weights).lower() not in ('none', 'scratch', 'random'))
+            else:
+                pretrained_flag = bool(args.pretrained)
+
+            # Resolve weights (torchvision path)
+            tv_weights, has_new_api = _resolve_weights_multiapi(args.backbone, args.weights)
+            print(f"[Info] Backbone={args.backbone} | tv_weights={args.weights} -> {tv_weights} | hub.pretrained={pretrained_flag}")
+
+            # ---- Build backbone ----
+            model_backbone = None
+
+            # Case A: chenyaofo CIFAR Hub
+            if re.match(r'^cifar(10|100)_.+$', args.backbone) and (args.cifar_hub in ('auto', 'chenyaofo')):
+                used_provider = 'chenyaofo/pytorch-cifar-models'
+                model_backbone = torch.hub.load(used_provider, args.backbone, pretrained=pretrained_flag)
+                args.input_size = 32
+                print(f"[Info] Loaded {args.backbone} from {used_provider} (input_size=32).")
+
+            # Case B: akamaster CIFAR-10 ResNet family
+            elif args.backbone in ('cifar_resnet56', 'resnet56_cifar', 'akamaster_resnet56', 'resnet56_cifar10') \
+                 or (re.match(r'^akamaster_resnet(20|32|44|56|110)$', args.backbone) is not None) \
+                 or (args.cifar_hub == 'akamaster' and re.match(r'^cifar10_resnet(20|32|44|56|110)$', args.backbone)):
+                used_provider = 'akamaster/pytorch_resnet_cifar10'
+                if args.backbone.startswith('akamaster_resnet'):
+                    entry = args.backbone.replace('akamaster_', '')
+                else:
+                    entry = re.sub(r'^cifar(10|100)_', '', args.backbone)
+                    if not entry.startswith('resnet'):
+                        entry = 'resnet56'
+                model_backbone = torch.hub.load(used_provider, entry)
+                args.input_size = 32
+                print(f"[Info] Loaded {entry} from {used_provider} (input_size=32).")
+
+            # Case C: torchvision (ImageNet family)
+            if model_backbone is None:
+                try:
+                    if has_new_api:
+                        from torchvision.models import get_model
+                        model_backbone = get_model(args.backbone, weights=tv_weights)
+                    else:
+                        fn = getattr(torchvision.models, args.backbone)
+                        pretrained = (tv_weights == 'legacy_pretrained')
+                        try:
+                            model_backbone = fn(pretrained=pretrained, num_classes=1000)
+                        except TypeError:
+                            model_backbone = fn(pretrained=pretrained)
+                    print(f"[Info] Loaded {args.backbone} from torchvision.")
+                except AttributeError as e:
+                    raise RuntimeError(f"Backbone '{args.backbone}' is not available in torchvision or supported hubs.") from e
+
+            # Freeze backbone if requested
+            if args.freeze_backbone:
+                for p_ in model_backbone.parameters():
+                    p_.requires_grad = False
+                for m in model_backbone.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+                        if m.affine:
+                            if m.weight is not None:
+                                m.weight.requires_grad = False
+                            if m.bias is not None:
+                                m.bias.requires_grad = False
+
+            # --- Define Adapters ---
+            if args.tuning_method in ('conv', 'adapter'):
+                class ConvAdapter(nn.Module):
+                    def __init__(self, c, k=args.kernel_size):
+                        super().__init__()
+                        h = max(1, int(c // max(1, int(args.adapt_size))))
+                        self.net = nn.Sequential(
+                            nn.Conv2d(c, h, 1, bias=False), nn.ReLU(inplace=True),
+                            nn.Conv2d(h, h, k, padding=k // 2, groups=h, bias=False), nn.ReLU(inplace=True),
+                            nn.Conv2d(h, c, 1, bias=False)
+                        )
+                    def forward(self, x):
+                        return self.net(x)
+                def make_adapter(ch): return ConvAdapter(ch)
+
+            elif args.tuning_method == 'hcc':
+                from models.hcc_adapter import HCCAdapter
+                def make_adapter(ch):
+                    m = HCCAdapter(
+                        C=ch, M=args.hcc_M, h=args.hcc_h, axis=args.hcc_axis,
+                        per_channel=args.hcc_per_channel, tie_sym=args.hcc_tie_sym,
+                        use_pw=args.hcc_use_pw, pw_ratio=args.hcc_pw_ratio,
+                        residual_scale=args.adapt_scale, gate_init=args.hcc_gate_init,
+                        padding_mode={'reflect': 'reflect', 'replicate': 'replicate', 'zeros': 'zeros'}.get(args.hcc_padding, 'reflect')
+                    )
+                    m.is_hcc_adapter = True
+                    return m
+
+            else:  # residual adapters
+                ra_wrap_ok = False
+                ra_adapter_param_ids = set()
+                try:
+                    from models.tuning_modules.residual_adapter import (
+                        attach_residual_adapters_resnet,
+                        ParallelResidualAdapter, SeriesResidualAdapter
+                    )
+                    if args.backbone.startswith('resnet'):  # torchvision ResNet only
+                        stages = [int(s.strip()) for s in args.ra_stages.split(',') if s.strip().isdigit()]
+                        model_backbone = attach_residual_adapters_resnet(
+                            model_backbone,
+                            mode=args.ra_mode,
+                            reduction=args.ra_reduction,
+                            norm=args.ra_norm,
+                            act=args.ra_act,
+                            gate_init=args.ra_gate_init,
+                            stages=stages
+                        )
+                        ra_wrap_ok = True
+                        for mod in model_backbone.modules():
+                            if isinstance(mod, (ParallelResidualAdapter, SeriesResidualAdapter)):
+                                for p in mod.parameters():
+                                    if p.requires_grad:
+                                        ra_adapter_param_ids.add(id(p))
+                except Exception as e:
+                    print(f"[Warn] residual_adapter wrapper not available ({e}). Falling back to hook-based adapters.")
+
+                if not ra_wrap_ok:
+                    def _norm2d(c):
+                        if args.ra_norm == 'bn': return nn.BatchNorm2d(c)
+                        if args.ra_norm == 'ln': return nn.GroupNorm(1, c)
+                        return nn.Identity()
+                    def _act():
+                        return {'relu': nn.ReLU, 'gelu': nn.GELU, 'silu': nn.SiLU, 'none': nn.Identity}[args.ra_act]()
+                    class ResidualCore(nn.Module):
+                        def __init__(self, c):
+                            super().__init__()
+                            h = max(1, c // max(1, args.ra_reduction))
+                            self.core = nn.Sequential(
+                                nn.Conv2d(c, h, 1, bias=False), _norm2d(h), _act(),
+                                nn.Conv2d(h, c, 1, bias=False), _norm2d(c)
+                            )
+                            self.gate = nn.Parameter(torch.tensor(float(args.ra_gate_init)))
+                        def forward(self, x):
+                            return self.core(x) * self.gate
+                    def make_adapter(ch): return ResidualCore(ch)
+
+            # --- Attach adapters across blocks ---
+            try:
+                from torchvision.models.resnet import BasicBlock, Bottleneck
+            except Exception:
+                BasicBlock = Bottleneck = tuple()
+
+            try:
+                from torchvision.models.convnext import CNBlock
+            except Exception:
+                CNBlock = tuple()
+            try:
+                from torchvision.models.efficientnet import MBConv, FusedMBConv
+            except Exception:
+                MBConv = FusedMBConv = tuple()
+            try:
+                from torchvision.models.mobilenetv3 import InvertedResidual
+            except Exception:
+                InvertedResidual = tuple()
+
+            def _attach(module: nn.Module, out_ch: int):
+                module.add_module('pet_adapter', make_adapter(out_ch))
+                def hook(mod, _in, out):
+                    if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
+                        return mod.pet_adapter(out)
+                    if args.tuning_method in ('conv', 'adapter'):
+                        return out + args.adapt_scale * mod.pet_adapter(out)
+                    if args.tuning_method == 'residual':
+                        xin = _in[0] if isinstance(_in, (tuple, list)) and len(_in) > 0 else out
+                        return out + (mod.pet_adapter(xin) if args.ra_mode == 'parallel' else mod.pet_adapter(out))
+                    return out
+                module.register_forward_hook(hook)
+
+            for m in model_backbone.modules():
+                attached = False
+                if BasicBlock and isinstance(m, BasicBlock):
+                    _attach(m, m.conv2.out_channels); attached = True
+                elif Bottleneck and isinstance(m, Bottleneck):
+                    _attach(m, m.conv3.out_channels); attached = True
+                elif hasattr(m, 'conv3') and isinstance(getattr(m, 'conv3'), nn.Conv2d):
+                    _attach(m, m.conv3.out_channels); attached = True
+                elif hasattr(m, 'conv2') and isinstance(getattr(m, 'conv2'), nn.Conv2d):
+                    _attach(m, m.conv2.out_channels); attached = True
+                elif CNBlock and isinstance(m, CNBlock):
+                    if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
+                        _attach(m, m.dwconv.out_channels); attached = True
+                    elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
+                        _attach(m, m.block[0].out_channels); attached = True
+                elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
+                    out_ch = getattr(m, 'out_channels', None)
+                    if out_ch is None:
+                        last_conv = None
+                        for c in m.modules():
+                            if isinstance(c, nn.Conv2d): last_conv = c
+                        if last_conv is not None:
+                            out_ch = last_conv.out_channels
+                    if out_ch is not None:
+                        _attach(m, out_ch); attached = True
+                elif InvertedResidual and isinstance(m, InvertedResidual):
+                    out_ch = getattr(m, 'out_channels', None)
+                    if out_ch is None:
+                        last_conv = None
+                        for c in m.modules():
+                            if isinstance(c, nn.Conv2d): last_conv = c
+                        if last_conv is not None:
+                            out_ch = last_conv.out_channels
+                    if out_ch is not None:
+                        _attach(m, out_ch); attached = True
+
+            # Replace classifier head to match nb_classes
+            def _maybe_replace_linear(parent, name, lin: nn.Linear, num_classes: int):
+                if not isinstance(lin, nn.Linear):
+                    return False
+                if args.keep_pretrained_head and lin.out_features == num_classes:
+                    return False
+                new_lin = nn.Linear(lin.in_features, num_classes)
+                setattr(parent, name, new_lin)
+                return True
+
+            replaced = False
+            if hasattr(model_backbone, 'fc') and isinstance(model_backbone.fc, nn.Linear):
+                replaced = _maybe_replace_linear(model_backbone, 'fc', model_backbone.fc, args.nb_classes)
+            elif hasattr(model_backbone, 'classifier'):
+                head = model_backbone.classifier
+                if isinstance(head, nn.Linear):
+                    replaced = _maybe_replace_linear(model_backbone, 'classifier', head, args.nb_classes)
+                elif isinstance(head, nn.Sequential):
+                    new_seq = list(head)
+                    for i in reversed(range(len(new_seq))):
+                        if isinstance(new_seq[i], nn.Linear):
+                            if not (args.keep_pretrained_head and new_seq[i].out_features == args.nb_classes):
+                                in_f = new_seq[i].in_features
+                                new_seq[i] = nn.Linear(in_f, args.nb_classes)
+                                model_backbone.classifier = nn.Sequential(*new_seq)
+                                replaced = True
+                            break
+            if not replaced and hasattr(model_backbone, 'linear') and isinstance(model_backbone.linear, nn.Linear):
+                replaced = _maybe_replace_linear(model_backbone, 'linear', model_backbone.linear, args.nb_classes)
+            if not replaced and hasattr(model_backbone, 'head') and isinstance(model_backbone.head, nn.Linear):
+                replaced = _maybe_replace_linear(model_backbone, 'head', model_backbone.head, args.nb_classes)
+
+            model = model_backbone
+
+        else:
+            # Default: repo builder
+            model = build_model(
+                args.model,
+                pretrained=True,
+                num_classes=args.nb_classes,
+                tuning_method=args.tuning_method,
+                args=args,
+            )
 
     # Move to device BEFORE profiling
     model.to(device)
 
-    # Profile (param/act memory) for visibility
+    # Profile memory
     memory_cost, detailed_info = profile_memory_cost(
         model, (1, 3, args.input_size, args.input_size), True,
         activation_bits=32, trainable_param_bits=32,
@@ -623,7 +711,7 @@ def main(args):
     for key, item in net_info.items():
         print(f"{key}: {item:.3f}")
 
-    # Optional finetune ckpt load
+    # Optional finetune ckpt
     if args.finetune:
         if args.finetune.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -701,7 +789,7 @@ def main(args):
     )
     # ---------------------------------------------------------------------
 
-    loss_scaler = NativeScaler()  # engine.py handles amp context
+    loss_scaler = NativeScaler()
 
     print("Use Cosine LR scheduler")
     lr_schedule_values = utils.cosine_scheduler(
@@ -744,13 +832,11 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
-        if wandb_logger:
-            wandb_logger.set_steps()
 
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
             device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
-            log_writer=log_writer, wandb_logger=wandb_logger, start_steps=epoch * num_training_steps_per_epoch,
+            log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
             use_amp=args.use_amp
@@ -808,12 +894,6 @@ def main(args):
                 log_writer.flush()
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
-
-        if wandb_logger:
-            wandb_logger.log_epoch_metrics(log_stats)
-
-    if wandb_logger and args.wandb_ckpt and args.save_ckpt and args.output_dir:
-        wandb_logger.log_checkpoints()
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

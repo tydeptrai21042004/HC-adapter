@@ -113,14 +113,21 @@ def _build_cars(args, is_train: bool):
     ds = datasets.StanfordCars(root=args.data_path, split=split, download=True, transform=tfm)
     return ds, 196
 
+def _split_subset(base, ratio=0.8, seed=42, is_train=True):
+    g = torch.Generator().manual_seed(seed)
+    idx = torch.randperm(len(base), generator=g)
+    ntr = int(ratio * len(base))
+    return torch.utils.data.Subset(base, idx[:ntr] if is_train else idx[ntr:])
+
 def _build_caltech101(args, is_train: bool):
-    # No standard split; follow common 80/20 split by official train/test indices not provided.
-    # We map is_train -> 'train' (torchvision exposes train/test split arg from v0.20?),
-    # else we simply use 'Caltech101' which returns (img, class_idx); we emulate a split via target index parity.
     tfm = _img_transforms(args, is_train)
-    ds = datasets.Caltech101(root=args.data_path, download=True, transform=tfm)
-    # Classes = 101 ( + background class depending on version; torchvision excludes background)
-    return ds, 101
+    base = datasets.Caltech101(root=args.data_path, download=True, transform=tfm)
+    return _split_subset(base, is_train=is_train), 101
+
+def _build_eurosat(args, is_train: bool):
+    tfm = _img_transforms(args, is_train)
+    base = datasets.EuroSAT(root=args.data_path, download=True, transform=tfm)
+    return _split_subset(base, is_train=is_train), 10
 
 def _build_dtd(args, is_train: bool):
     # DTD has Splits: 'train'|'val'|'test'. We use 'train' for train, 'val' for eval.
@@ -129,11 +136,7 @@ def _build_dtd(args, is_train: bool):
     ds = datasets.DTD(root=args.data_path, split=split, download=True, transform=tfm)
     return ds, 47
 
-def _build_eurosat(args, is_train: bool):
-    # EuroSAT: 10 classes; torchvision >=0.18
-    tfm = _img_transforms(args, is_train)
-    ds = datasets.EuroSAT(root=args.data_path, download=True, transform=tfm)
-    return ds, 10
+
 
 def _build_fgvc_aircraft(args, is_train: bool):
     # Splits: 'train', 'val', 'trainval', 'test' — use 'trainval' for train, 'test' for eval
