@@ -103,7 +103,7 @@ def get_args_parser():
                         help='Normalization inside adapter')
     parser.add_argument('--ra_act', type=str, default='relu', choices=['relu', 'gelu', 'silu', 'none'],
                         help='Activation inside adapter')
-    parser.add_argument('--ra_gate_init', type=float, default=0.0, help='Initial gate for adapter residual path')
+    parser.add_argument('--ra_gate_init', type=float, default=0.1, help='Initial gate for adapter residual path')
     parser.add_argument('--ra_stages', type=str, default='1,2,3,4',
                         help='ResNet stages to adapt (comma list), e.g., "2,3,4"')
 
@@ -507,6 +507,8 @@ def main(args):
                                 m.bias.requires_grad = False
 
             # --- Define Adapters ---
+            do_hook_attach = True  # <-- key: only use hook path when we actually defined make_adapter
+
             if args.tuning_method in ('conv', 'adapter'):
                 class ConvAdapter(nn.Module):
                     def __init__(self, c, k=args.kernel_size):
@@ -575,80 +577,85 @@ def main(args):
                             h = max(1, c // max(1, args.ra_reduction))
                             self.core = nn.Sequential(
                                 nn.Conv2d(c, h, 1, bias=False), _norm2d(h), _act(),
-                                nn.Conv2d(h, c, 1, bias=False), _norm2d(c)
+                                nn.Conv2d(h, c, 1, bias=False)
                             )
                             self.gate = nn.Parameter(torch.tensor(float(args.ra_gate_init)))
                         def forward(self, x):
                             return self.core(x) * self.gate
                     def make_adapter(ch): return ResidualCore(ch)
+                else:
+                    # Wrapper succeeded → adapters are already inside blocks; skip hook attachment
+                    do_hook_attach = False
 
-            # --- Attach adapters across blocks ---
-            try:
-                from torchvision.models.resnet import BasicBlock, Bottleneck
-            except Exception:
-                BasicBlock = Bottleneck = tuple()
+            # --- Attach adapters across blocks (only when needed) ---
+            if do_hook_attach:
+                try:
+                    from torchvision.models.resnet import BasicBlock, Bottleneck
+                except Exception:
+                    BasicBlock = Bottleneck = tuple()
 
-            try:
-                from torchvision.models.convnext import CNBlock
-            except Exception:
-                CNBlock = tuple()
-            try:
-                from torchvision.models.efficientnet import MBConv, FusedMBConv
-            except Exception:
-                MBConv = FusedMBConv = tuple()
-            try:
-                from torchvision.models.mobilenetv3 import InvertedResidual
-            except Exception:
-                InvertedResidual = tuple()
+                try:
+                    from torchvision.models.convnext import CNBlock
+                except Exception:
+                    CNBlock = tuple()
+                try:
+                    from torchvision.models.efficientnet import MBConv, FusedMBConv
+                except Exception:
+                    MBConv = FusedMBConv = tuple()
+                try:
+                    from torchvision.models.mobilenetv3 import InvertedResidual
+                except Exception:
+                    InvertedResidual = tuple()
 
-            def _attach(module: nn.Module, out_ch: int):
-                module.add_module('pet_adapter', make_adapter(out_ch))
-                def hook(mod, _in, out):
-                    if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
-                        return mod.pet_adapter(out)
-                    if args.tuning_method in ('conv', 'adapter'):
-                        return out + args.adapt_scale * mod.pet_adapter(out)
-                    if args.tuning_method == 'residual':
-                        xin = _in[0] if isinstance(_in, (tuple, list)) and len(_in) > 0 else out
-                        return out + (mod.pet_adapter(xin) if args.ra_mode == 'parallel' else mod.pet_adapter(out))
-                    return out
-                module.register_forward_hook(hook)
+                def _attach(module: nn.Module, out_ch: int):
+                    module.add_module('pet_adapter', make_adapter(out_ch))
+                    def hook(mod, _in, out):
+                        if getattr(mod.pet_adapter, 'is_hcc_adapter', False):
+                            return mod.pet_adapter(out)
+                        if args.tuning_method in ('conv', 'adapter'):
+                            return out + args.adapt_scale * mod.pet_adapter(out)
+                        if args.tuning_method == 'residual':
+                            xin = _in[0] if isinstance(_in, (tuple, list)) and len(_in) > 0 else out
+                            return out + (mod.pet_adapter(xin) if args.ra_mode == 'parallel' else mod.pet_adapter(out))
+                        return out
+                    module.register_forward_hook(hook)
 
-            for m in model_backbone.modules():
-                attached = False
-                if BasicBlock and isinstance(m, BasicBlock):
-                    _attach(m, m.conv2.out_channels); attached = True
-                elif Bottleneck and isinstance(m, Bottleneck):
-                    _attach(m, m.conv3.out_channels); attached = True
-                elif hasattr(m, 'conv3') and isinstance(getattr(m, 'conv3'), nn.Conv2d):
-                    _attach(m, m.conv3.out_channels); attached = True
-                elif hasattr(m, 'conv2') and isinstance(getattr(m, 'conv2'), nn.Conv2d):
-                    _attach(m, m.conv2.out_channels); attached = True
-                elif CNBlock and isinstance(m, CNBlock):
-                    if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
-                        _attach(m, m.dwconv.out_channels); attached = True
-                    elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
-                        _attach(m, m.block[0].out_channels); attached = True
-                elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
-                    out_ch = getattr(m, 'out_channels', None)
-                    if out_ch is None:
-                        last_conv = None
-                        for c in m.modules():
-                            if isinstance(c, nn.Conv2d): last_conv = c
-                        if last_conv is not None:
-                            out_ch = last_conv.out_channels
-                    if out_ch is not None:
-                        _attach(m, out_ch); attached = True
-                elif InvertedResidual and isinstance(m, InvertedResidual):
-                    out_ch = getattr(m, 'out_channels', None)
-                    if out_ch is None:
-                        last_conv = None
-                        for c in m.modules():
-                            if isinstance(c, nn.Conv2d): last_conv = c
-                        if last_conv is not None:
-                            out_ch = last_conv.out_channels
-                    if out_ch is not None:
-                        _attach(m, out_ch); attached = True
+                for m in model_backbone.modules():
+                    if BasicBlock and isinstance(m, BasicBlock):
+                        _attach(m, m.conv2.out_channels)
+                    elif Bottleneck and isinstance(m, Bottleneck):
+                        _attach(m, m.conv3.out_channels)
+                    elif hasattr(m, 'conv3') and isinstance(getattr(m, 'conv3'), nn.Conv2d):
+                        _attach(m, m.conv3.out_channels)
+                    elif hasattr(m, 'conv2') and isinstance(getattr(m, 'conv2'), nn.Conv2d):
+                        _attach(m, m.conv2.out_channels)
+                    elif CNBlock and isinstance(m, CNBlock):
+                        if hasattr(m, 'dwconv') and isinstance(m.dwconv, nn.Conv2d):
+                            _attach(m, m.dwconv.out_channels)
+                        elif hasattr(m, 'block') and len(getattr(m, 'block')) > 0 and isinstance(m.block[0], nn.Conv2d):
+                            _attach(m, m.block[0].out_channels)
+                    elif MBConv and isinstance(m, (MBConv, FusedMBConv)):
+                        out_ch = getattr(m, 'out_channels', None)
+                        if out_ch is None:
+                            last_conv = None
+                            for c in m.modules():
+                                if isinstance(c, nn.Conv2d):
+                                    last_conv = c
+                            if last_conv is not None:
+                                out_ch = last_conv.out_channels
+                        if out_ch is not None:
+                            _attach(m, out_ch)
+                    elif InvertedResidual and isinstance(m, InvertedResidual):
+                        out_ch = getattr(m, 'out_channels', None)
+                        if out_ch is None:
+                            last_conv = None
+                            for c in m.modules():
+                                if isinstance(c, nn.Conv2d):
+                                    last_conv = c
+                            if last_conv is not None:
+                                out_ch = last_conv.out_channels
+                        if out_ch is not None:
+                            _attach(m, out_ch)
 
             # Replace classifier head to match nb_classes
             def _maybe_replace_linear(parent, name, lin: nn.Linear, num_classes: int):

@@ -1,6 +1,7 @@
 # models/tuning_modules/residual_adapter.py
 import torch
 import torch.nn as nn
+from typing import Iterable
 
 # ---- small helpers -----------------------------------------------------------
 _ACTS = {
@@ -17,13 +18,16 @@ _NORMS = {
 }
 
 def _make_core(channels: int, reduction: int, norm: str, act: str) -> nn.Sequential:
-    """1x1 -> act -> 1x1 bottleneck core (no residual inside)."""
+    """
+    Standard adapter bottleneck: 1x1 -> norm -> act -> 1x1.
+    Using bias=False avoids redundant biases when norms are present.
+    """
     hidden = max(1, channels // max(1, int(reduction)))
     return nn.Sequential(
-        _NORMS[norm](channels),
-        nn.Conv2d(channels, hidden, kernel_size=1, bias=True),
+        nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+        _NORMS[norm](hidden),
         _ACTS[act],
-        nn.Conv2d(hidden, channels, kernel_size=1, bias=True),
+        nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
     )
 
 # ---- adapter wrappers --------------------------------------------------------
@@ -32,11 +36,12 @@ class ParallelResidualAdapter(nn.Module):
     PARALLEL residual adapter attached at a block output:
         y = Block(x)
         out = y + gate * Core(x)
-    Recommended for off-the-shelf pretrained CNNs.  (Rebuffi et al.)
+
+    This "block-level" parallel form is a practical post-hoc adapter for frozen CNNs.
     """
     def __init__(self, block: nn.Module, channels: int,
                  reduction: int = 16, norm: str = "bn",
-                 act: str = "relu", gate_init: float = 0.0):
+                 act: str = "relu", gate_init: float = 0.1):
         super().__init__()
         self.block = block
         self.core  = _make_core(channels, reduction, norm, act)
@@ -52,12 +57,10 @@ class SeriesResidualAdapter(nn.Module):
     SERIES residual adapter attached AFTER the block (light extra layer):
         y = Block(x)
         out = y + gate * Core(y)
-    Note: series adapters generally work best when present during pretraining,
-    otherwise they can underperform vs. parallel if added post hoc.  (Rebuffi et al.)
     """
     def __init__(self, block: nn.Module, channels: int,
                  reduction: int = 16, norm: str = "bn",
-                 act: str = "relu", gate_init: float = 0.0):
+                 act: str = "relu", gate_init: float = 0.1):
         super().__init__()
         self.block = block
         self.core  = _make_core(channels, reduction, norm, act)
@@ -71,7 +74,7 @@ class SeriesResidualAdapter(nn.Module):
 # ---- builders/attach utilities ----------------------------------------------
 def build_residual_adapter(block: nn.Module, channels: int, mode: str = "parallel",
                            reduction: int = 16, norm: str = "bn",
-                           act: str = "relu", gate_init: float = 0.0) -> nn.Module:
+                           act: str = "relu", gate_init: float = 0.1) -> nn.Module:
     if mode == "parallel":
         return ParallelResidualAdapter(
             block, channels, reduction=reduction, norm=norm, act=act, gate_init=gate_init
@@ -86,8 +89,8 @@ def build_residual_adapter(block: nn.Module, channels: int, mode: str = "paralle
 def _wrap_resnet_layer(layer: nn.Sequential, mode: str,
                        reduction: int, norm: str, act: str, gate_init: float):
     """
-    Replace each block in a ResNet layer with an adapter-wrapped block.
-    Supports torchvision BasicBlock / Bottleneck.
+    Replace each block in a torchvision ResNet layer with an adapter-wrapped block.
+    Supports BasicBlock / Bottleneck.
     """
     for i, blk in enumerate(layer):
         # Infer output channel width per block
@@ -102,12 +105,12 @@ def _wrap_resnet_layer(layer: nn.Sequential, mode: str,
         )
 
 def attach_residual_adapters_resnet(model: nn.Module,
-                                    stages=(1, 2, 3, 4),
+                                    stages: Iterable[int] = (1, 2, 3, 4),
                                     mode: str = "parallel",
                                     reduction: int = 16,
                                     norm: str = "bn",
                                     act: str = "relu",
-                                    gate_init: float = 0.0) -> nn.Module:
+                                    gate_init: float = 0.1) -> nn.Module:
     """
     Attach residual adapters to torchvision-style ResNet (layer1..layer4).
     """
