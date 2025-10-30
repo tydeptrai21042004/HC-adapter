@@ -300,4 +300,4 @@ class HCCAdapter(nn.Module):
 
 # convenience alias for your previous import path
 " 
-![Alt text](accuracy_vs_neglog10_params.jpg "Optional Title")
+![Alt text](accuracy_vs_neglog10_params.png "Optional Title")
