@@ -5,36 +5,42 @@ import torch.nn.functional as F
 from math import gcd
 
 class HCCAdapter(nn.Module):
-    """
-    HCC (even-shift) adapter with group-shared alphas and grouped 1x1 mixing.
-
-    Params that control size:
-      - alpha_group: share alpha across groups of channels (C//alpha_group groups)
-      - pw_ratio: bottleneck ratio H = max(1, C // pw_ratio)
-      - pw_groups: number of groups for BOTH 1x1 convs (divides C and H)
-      - use_bn: add BN inside PW path (defaults False to save params)
-      - no_pw: if True, skip PW mixing entirely (pure depthwise HCC)
-    """
     def __init__(
         self, C, M=1, h=1, axis='hw',
-        alpha_group=16,             # share α every 16 channels (tune)
+        alpha_group=16,             # NEW API (group-shared alphas)
         tie_sym=True,
-        no_pw=False,                # optionally remove PW mixing
-        pw_ratio=32,                # narrower than your 8 → big param cut
-        pw_groups=4,                # grouped 1x1 (must divide C and H)
+        no_pw=False,                # NEW API (inverse of legacy use_pw)
+        pw_ratio=32,
+        pw_groups=4,
         use_bn=False,
         residual_scale=1.0,
         gate_init=0.1,
-        padding_mode='reflect'
+        padding_mode='reflect',
+        **legacy,                   # <-- accept unknown legacy kwargs
     ):
         super().__init__()
-        assert axis in ('h', 'w', 'hw')
+        assert axis in ('h','w','hw')
         self.C, self.M, self.h = int(C), int(M), int(h)
         self.axis = axis
         self.tie_sym = tie_sym
         self.padding_mode = padding_mode
         self.residual_scale = residual_scale
-        self.no_pw = no_pw
+
+        # --- translate legacy args ---
+        # per_channel=True  -> alpha_group = 1
+        if 'per_channel' in legacy:
+            per_channel = bool(legacy.pop('per_channel'))
+            alpha_group = 1 if per_channel else alpha_group
+        # use_pw=True -> no_pw=False
+        if 'use_pw' in legacy:
+            use_pw_legacy = bool(legacy.pop('use_pw'))
+            no_pw = (not use_pw_legacy)
+        # ignore any other legacy keys silently (or log if you prefer)
+
+        self.alpha_group = max(1, int(alpha_group))
+        self.no_pw = bool(no_pw)
+        self.use_bn = bool(use_bn)
+
 
         # ---------- α coefficients (group-shared) ----------
         self.alpha_group = max(1, int(alpha_group))
