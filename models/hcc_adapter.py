@@ -1,145 +1,117 @@
-# file: models/hcc_adapter.py
+# models/hcc_adapter.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from math import gcd
 
 class HCCAdapter(nn.Module):
     """
-    Hartley–Cosine (even) shift aggregation via depthwise dilated conv.
-    - Axis: 'h', 'w', or 'hw' (sum).
-    - Tie ±m weights; learn per-channel alphas (center + M side taps).
-    - Optional pointwise bottleneck mixing + BN.
-    - Reflect padding by default to avoid wrap artifacts.
+    HCC (even-shift) adapter with group-shared alphas and grouped 1x1 mixing.
+
+    Params that control size:
+      - alpha_group: share alpha across groups of channels (C//alpha_group groups)
+      - pw_ratio: bottleneck ratio H = max(1, C // pw_ratio)
+      - pw_groups: number of groups for BOTH 1x1 convs (divides C and H)
+      - use_bn: add BN inside PW path (defaults False to save params)
+      - no_pw: if True, skip PW mixing entirely (pure depthwise HCC)
     """
     def __init__(
         self, C, M=1, h=1, axis='hw',
-        per_channel=True, tie_sym=True,
-        use_pw=True, pw_ratio=8, use_bn=True,
-        residual_scale=1.0, gate_init=0.1,
+        alpha_group=16,             # share α every 16 channels (tune)
+        tie_sym=True,
+        no_pw=False,                # optionally remove PW mixing
+        pw_ratio=32,                # narrower than your 8 → big param cut
+        pw_groups=4,                # grouped 1x1 (must divide C and H)
+        use_bn=False,
+        residual_scale=1.0,
+        gate_init=0.1,
         padding_mode='reflect'
     ):
         super().__init__()
-        assert axis in ('h','w','hw')
-        self.C = C
-        self.M = int(M)
-        self.h = int(h)
+        assert axis in ('h', 'w', 'hw')
+        self.C, self.M, self.h = int(C), int(M), int(h)
         self.axis = axis
         self.tie_sym = tie_sym
-        self.per_channel = per_channel
         self.padding_mode = padding_mode
         self.residual_scale = residual_scale
+        self.no_pw = no_pw
 
-        K = 2*M + 1  # kernel length along axis
-
-        # Learn alpha coefficients: center + M side (shared or per-channel)
-        ncoef = M + 1
-        if per_channel:
-            self.alpha = nn.Parameter(torch.zeros(C, ncoef))
-        else:
-            self.alpha = nn.Parameter(torch.zeros(ncoef))
-
-        # Identity-safe init: center ≈ 1, sides ≈ 0
+        # ---------- α coefficients (group-shared) ----------
+        self.alpha_group = max(1, int(alpha_group))
+        G = max(1, self.C // self.alpha_group)   # number of channel groups
+        ncoef = self.M + 1                       # center + M side taps
+        # α stored per group → shape (G, ncoef)
+        self.alpha = nn.Parameter(torch.zeros(G, ncoef))
         with torch.no_grad():
-            if per_channel:
-                self.alpha[:, 0].fill_(1.0)
-            else:
-                self.alpha[0] = 1.0
+            self.alpha[:, 0].fill_(1.0)          # identity-safe init
 
-        # Optional channel mixing (DW -> PW bottleneck -> PW expand)
-        self.use_pw = use_pw
-        if use_pw:
-            hid = max(1, C // pw_ratio)
-            self.pw = nn.Sequential(
-                nn.Conv2d(C, hid, 1, bias=False),
-                nn.BatchNorm2d(hid) if use_bn else nn.Identity(),
+        # ---------- optional channel mixing via PW (grouped) ----------
+        self.use_bn = bool(use_bn)
+        if not self.no_pw:
+            H = max(1, self.C // max(1, int(pw_ratio)))
+            # make groups legal for both 1x1 convs
+            g = max(1, int(pw_groups))
+            g = min(g, self.C, H)
+            # ensure groups divide both C and H
+            g = gcd(g, self.C)
+            g = gcd(g, H) or 1
+            self.pw_groups = g
+            layers = [
+                nn.Conv2d(self.C, H, 1, groups=g, bias=False),
+                nn.BatchNorm2d(H) if self.use_bn else nn.Identity(),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(hid, C, 1, bias=False),
-                nn.BatchNorm2d(C) if use_bn else nn.Identity(),
-            )
+                nn.Conv2d(H, self.C, 1, groups=g, bias=False),
+                nn.BatchNorm2d(self.C) if self.use_bn else nn.Identity(),
+            ]
+            self.pw = nn.Sequential(*layers)
         else:
             self.pw = nn.Identity()
 
-        # Learnable global gate (can switch to per-channel gate if desired)
+        # ---------- global residual gate ----------
         self.gate = nn.Parameter(torch.tensor(float(gate_init)))
 
+    # build per-group 1D even kernel → expand to (C,1,K)
     def _build_even_kernel_1d(self, device, dtype):
-        """
-        Build symmetric 1D kernel of length K = 2M+1 from alpha (center + M sides).
-        If per_channel=True, returns weight shape for depthwise conv (C,1,K).
-        Else returns (1,1,K) and we expand to groups=C.
-        """
-        M, C = self.M, self.C
-        K = 2*M + 1
-
-        # Compose full even kernel from alpha [alpha0, alpha1..alphaM]
-        # w[k] = alpha0 at center; alpha_m at ±m positions
-        if self.per_channel:
-            # (C, K)
-            w = torch.zeros(C, K, device=device, dtype=dtype)
-            center = M
-            w[:, center] = self.alpha[:, 0]
-            for m in range(1, M+1):
-                if self.tie_sym:
-                    w[:, center - m] = self.alpha[:, m]
-                    w[:, center + m] = self.alpha[:, m]
-                else:
-                    # If you later store separate +/−, split here
-                    w[:, center - m] = self.alpha[:, m]
-                    w[:, center + m] = self.alpha[:, m]
-            # normalize (optional but recommended)
-            s = w.abs().sum(dim=1, keepdim=True).clamp_min(1e-6)
-            w = w / s
-            # depthwise weight (C,1,K)
-            return w.unsqueeze(1)
-        else:
-            # (K,)
-            w = torch.zeros(K, device=device, dtype=dtype)
-            center = M
-            w[center] = self.alpha[0]
-            for m in range(1, M+1):
-                val = self.alpha[m]
-                if self.tie_sym:
-                    w[center-m] = val
-                    w[center+m] = val
-                else:
-                    w[center-m] = val
-                    w[center+m] = val
-            s = w.abs().sum().clamp_min(1e-6)
-            w = w / s
-            # expand to depthwise (C,1,K)
-            return w.view(1,1,K).repeat(self.C, 1, 1)
+        K = 2*self.M + 1
+        G = max(1, self.C // self.alpha_group)
+        # (G, K) then expand → (C, K)
+        wg = torch.zeros(G, K, device=device, dtype=dtype)
+        center = self.M
+        wg[:, center] = self.alpha[:, 0]
+        for m in range(1, self.M+1):
+            val = self.alpha[:, m]
+            wg[:, center - m] = val
+            wg[:, center + m] = val if self.tie_sym else val  # kept symmetric here
+        # normalize within each group (optional but stable)
+        s = wg.abs().sum(dim=1, keepdim=True).clamp_min(1e-6)
+        wg = wg / s
+        # expand per group to channels
+        reps = [self.alpha_group] * G
+        reps[-1] = self.C - self.alpha_group*(G-1)  # handle remainder
+        w = torch.cat([wg[i].unsqueeze(0).repeat(reps[i], 1) for i in range(G)], dim=0)  # (C, K)
+        return w.unsqueeze(1)  # (C,1,K)
 
     def _pad(self, x, pad_h, pad_w):
-        if self.padding_mode == 'reflect':
-            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='reflect')
-        elif self.padding_mode == 'replicate':
-            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='replicate')
-        else:
-            # 'zeros'
-            return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode='constant', value=0.0)
+        mode = 'reflect' if self.padding_mode == 'reflect' else \
+               'replicate' if self.padding_mode == 'replicate' else 'constant'
+        val = 0.0 if mode == 'constant' else None
+        return F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode=mode, value=0.0 if val is not None else None)
 
     def forward(self, x):
         B, C, H, W = x.shape
         w1d = self._build_even_kernel_1d(x.device, x.dtype)  # (C,1,K)
-
         y = 0
-        K = 2*self.M + 1
         if 'h' in self.axis:
-            # depthwise conv along height -> kernel size (K,1), dilation (h,1)
-            wh = w1d.view(self.C, 1, K, 1)
+            wh = w1d.view(self.C, 1, 2*self.M+1, 1)
             xh = self._pad(x, pad_h=self.M*self.h, pad_w=0)
-            yh = F.conv2d(xh, wh, bias=None, stride=1, padding=0,
-                          dilation=(self.h, 1), groups=self.C)
+            yh = F.conv2d(xh, wh, stride=1, padding=0, dilation=(self.h,1), groups=self.C)
             y = y + yh
-
         if 'w' in self.axis:
-            # depthwise conv along width -> kernel size (1,K), dilation (1,h)
-            ww = w1d.view(self.C, 1, 1, K)
+            ww = w1d.view(self.C, 1, 1, 2*self.M+1)
             xw = self._pad(x, pad_h=0, pad_w=self.M*self.h)
-            yw = F.conv2d(xw, ww, bias=None, stride=1, padding=0,
-                          dilation=(1, self.h), groups=self.C)
+            yw = F.conv2d(xw, ww, stride=1, padding=0, dilation=(1,self.h), groups=self.C)
             y = y + yw
-
-        # Residual + optional PW mixing + gate
         y = self.pw(y)
         return x + self.residual_scale * self.gate * y
+
+# convenience alias for your previous import path
